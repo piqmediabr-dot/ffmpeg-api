@@ -80,3 +80,8 @@ def concat_and_upload():
     except Exception as e:
         return jsonify({"ok": False, "step":"drive_upload", "error": str(e)}), 500
 EOF
+if __name__ == "__main__":
+    import os
+    port = int(os.environ.get("PORT", "8080"))
+    # O Cloud Run exige bind em 0.0.0.0 e na porta $PORT
+    app.run(host="0.0.0.0", port=port)
