@@ -1,8 +1,9 @@
-# (opcional) manter logs no bucket, se você já usava isso:
-# logsBucket: gs://piqmediaautomation-cb-logs-371441574793
-# options:
-#   logging: GCS_ONLY
-#   defaultLogsBucketBehavior: REGIONAL_USER_OWNED_BUCKET
+logsBucket: gs://piqmediaautomation-cb-logs-371441574793
+
+options:
+  # opcional (pode deixar assim)
+  logging: GCS_ONLY
+  defaultLogsBucketBehavior: REGIONAL_USER_OWNED_BUCKET
 
 steps:
   - name: gcr.io/cloud-builders/docker
