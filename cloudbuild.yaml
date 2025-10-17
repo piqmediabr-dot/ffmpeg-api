@@ -1,3 +1,8 @@
+options:
+  logging: GCS_ONLY
+  logBucket: gs://piqmediaautomation-cb-logs-371441574793
+  defaultLogsBucketBehavior: REGIONAL_USER_OWNED_BUCKET
+
 steps:
   - name: gcr.io/cloud-builders/docker
     args:
@@ -5,6 +10,7 @@ steps:
       - -t
       - us-central1-docker.pkg.dev/$PROJECT_ID/ffmpeg/ffmpeg-api:$SHORT_SHA
       - .
+
 images:
   - us-central1-docker.pkg.dev/$PROJECT_ID/ffmpeg/ffmpeg-api:$SHORT_SHA
   - us-central1-docker.pkg.dev/$PROJECT_ID/ffmpeg/ffmpeg-api:v1
