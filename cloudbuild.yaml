@@ -1,6 +1,8 @@
+logsBucket: gs://piqmediaautomation-cb-logs-371441574793
+
 options:
+  # opcional (pode deixar assim)
   logging: GCS_ONLY
-  logBucket: gs://piqmediaautomation-cb-logs-371441574793
   defaultLogsBucketBehavior: REGIONAL_USER_OWNED_BUCKET
 
 steps:
