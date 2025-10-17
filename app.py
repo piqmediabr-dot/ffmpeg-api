@@ -1,209 +1,161 @@
-# app.py
 from flask import Flask, request, jsonify
-import os
-import uuid
-import shutil
-import tempfile
-import subprocess
-from datetime import timedelta
-from typing import List, Optional
-
+import os, json, tempfile, subprocess, shutil, time
 import requests
-from google.cloud import storage
-from google.api_core import exceptions as gcloud_exceptions
+
+# Google Drive
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaFileUpload
+import google.auth
+from google.oauth2 import service_account
 
 app = Flask(__name__)
-# Aceitar rotas com e sem barra final
-app.url_map.strict_slashes = False
 
-# CORS básico
-@app.after_request
-def add_cors(resp):
-    resp.headers["Access-Control-Allow-Origin"] = "*"
-    resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
-    resp.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS, GET"
-    return resp
+SCOPES = ["https://www.googleapis.com/auth/drive.file"]
 
-# ---------- Utilidades ----------
-def _json_error(code: int, msg: str):
-    return jsonify({"status": "error", "detail": msg}), code
+def get_gcp_creds():
+    """
+    1) Se GOOGLE_APPLICATION_CREDENTIALS estiver apontando para um arquivo válido (ADC), usa.
+    2) Senão, se SERVICE_ACCOUNT_JSON existir (conteúdo JSON), usa ele.
+    """
+    gac = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "")
+    if gac and os.path.exists(gac):
+        creds, _ = google.auth.default(scopes=SCOPES)
+        return creds
 
-def _ensure_ffmpeg():
-    try:
-        subprocess.run(["ffmpeg", "-version"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
-    except Exception:
-        raise RuntimeError("FFmpeg não encontrado no container. Instale-o no Dockerfile (apt-get install -y ffmpeg).")
+    sa_json = os.environ.get("SERVICE_ACCOUNT_JSON")
+    if sa_json:
+        info = json.loads(sa_json)
+        return service_account.Credentials.from_service_account_info(info, scopes=SCOPES)
 
-def _download_to_tmp(url: str, tmpdir: str) -> str:
-    local = os.path.join(tmpdir, f"in_{uuid.uuid4().hex}.mp4")
-    try:
-        with requests.get(url, stream=True, timeout=120) as r:
-            r.raise_for_status()
-            with open(local, "wb") as f:
-                for chunk in r.iter_content(chunk_size=1024 * 1024):
-                    if chunk:
-                        f.write(chunk)
-        return local
-    except Exception as e:
-        raise RuntimeError(f"Falha ao baixar {url}: {e}")
+    raise RuntimeError("Credenciais GCP não encontradas. Configure GOOGLE_APPLICATION_CREDENTIALS ou SERVICE_ACCOUNT_JSON.")
 
-def _make_list_file(paths: List[str], tmpdir: str) -> str:
-    lst = os.path.join(tmpdir, "concat.txt")
-    with open(lst, "w", encoding="utf-8") as f:
-        for p in paths:
+def download_file(url: str, dest_path: str, timeout_sec: int = 120):
+    with requests.get(url, stream=True, timeout=timeout_sec) as r:
+        r.raise_for_status()
+        with open(dest_path, "wb") as f:
+            for chunk in r.iter_content(chunk_size=1024 * 1024):
+                if chunk:
+                    f.write(chunk)
+
+def concat_videos(input_paths, output_path):
+    """
+    Usa o demuxer concat. Para máxima compatibilidade, reencode (x264 + aac).
+    """
+    list_file = output_path + ".inputs.txt"
+    with open(list_file, "w", encoding="utf-8") as f:
+        for p in input_paths:
+            # caminhos seguros para ffmpeg
             f.write(f"file '{p}'\n")
-    return lst
 
-def _run_ffmpeg(cmd: List[str]):
-    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    if proc.returncode != 0:
-        err = (proc.stderr or b"").decode(errors="ignore")
-        raise RuntimeError(f"FFmpeg falhou: {err[:1000]}")
+    # Reencode para evitar falhas de 'different codecs/timebase'
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-f", "concat",
+        "-safe", "0",
+        "-i", list_file,
+        "-c:v", "libx264",
+        "-preset", "veryfast",
+        "-crf", "23",
+        "-c:a", "aac",
+        "-b:a", "192k",
+        "-movflags", "+faststart",
+        output_path,
+    ]
+    subprocess.run(cmd, check=True)
 
-def _upload_to_gcs(local_file: str, bucket_name: str, object_name: str) -> str:
-    client = storage.Client()
-    bucket = client.bucket(bucket_name)
-    blob = bucket.blob(object_name)
-    blob.upload_from_filename(local_file, content_type="video/mp4")
-    return f"gs://{bucket_name}/{object_name}"
+def drive_upload(creds, file_path, folder_id, output_name, make_public=False):
+    service = build("drive", "v3", credentials=creds)
+    file_metadata = {
+        "name": output_name,
+        "parents": [folder_id]
+    }
+    media = MediaFileUpload(file_path, mimetype="video/mp4", resumable=True)
+    file = service.files().create(body=file_metadata, media_body=media, fields="id, webViewLink, webContentLink, name, size").execute()
 
-def _signed_url(bucket_name: str, object_name: str, minutes: int) -> Optional[str]:
-    try:
-        client = storage.Client()
-        blob = client.bucket(bucket_name).blob(object_name)
-        return blob.generate_signed_url(
-            version="v4",
-            expiration=timedelta(minutes=max(1, minutes)),
-            method="GET",
-            response_disposition=f'attachment; filename="{os.path.basename(object_name)}"'
-        )
-    except gcloud_exceptions.GoogleAPICallError:
-        return None
-    except Exception:
-        return None
+    if make_public:
+        service.permissions().create(
+            fileId=file["id"],
+            body={"role": "reader", "type": "anyone"},
+        ).execute()
+        # Recarrega links após permissão (opcional)
+        file = service.files().get(fileId=file["id"], fields="id, webViewLink, webContentLink, name, size").execute()
 
-# ---------- Rotas básicas ----------
+    return file
+
 @app.route("/", methods=["GET"])
 def index():
-    return jsonify({
-        "status": "ok",
-        "message": "FFmpeg API online e respondendo!",
-        "endpoints": ["/health", "/concat_and_upload"]
-    }), 200
+    return jsonify({"status": "ok", "message": "FFmpeg API online"}), 200
 
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"ok": True}), 200
 
-# Mantido para compatibilidade (placeholder)
 @app.route("/process", methods=["POST"])
 def process():
-    data = request.get_json(force=True, silent=True) or {}
-    return jsonify({"received": data, "status": "processing_soon"}), 200
-
-# ---------- Endpoint principal ----------
-@app.route("/concat_and_upload", methods=["POST", "OPTIONS"])
-def concat_and_upload():
-    # Preflight CORS
-    if request.method == "OPTIONS":
-        return ("", 204)
-
     """
-    Body JSON:
+    Espera um JSON:
     {
-      "input_videos": ["https://...mp4", "https://...mp4"],
-      "bucket_name": "meu-bucket",
-      "output_filename": "final.mp4",           # opcional
-      "concat_mode": "reencode" | "copy",       # opcional (default reencode)
-      "signed_url_expiration_minutes": 60       # opcional
+      "inputs": ["https://...mp4", "https://...mp4"],
+      "output_basename": "Story_DEMO_final",
+      "drive_folder_id": "xxxxxxxxxxxxxxxxxxxx",
+      "public": true
     }
     """
-    body = request.get_json(force=True, silent=True)
-    if not body:
-        return _json_error(400, "JSON inválido ou ausente.")
+    payload = request.get_json(force=True, silent=True) or {}
+    inputs = payload.get("inputs") or []
+    folder_id = payload.get("drive_folder_id")
+    out_base = payload.get("output_basename", f"concat_{int(time.time())}")
+    make_public = bool(payload.get("public", False))
 
-    input_videos = body.get("input_videos") or []
-    bucket_name = body.get("bucket_name")
-    output_filename = (body.get("output_filename") or "").strip()
-    concat_mode = (body.get("concat_mode") or "reencode").lower()
-    exp_minutes = int(body.get("signed_url_expiration_minutes") or 60)
+    if not inputs or not isinstance(inputs, list) or not folder_id:
+        return jsonify({
+            "status": "error",
+            "message": "JSON inválido. Necessário 'inputs' (lista de URLs) e 'drive_folder_id'."
+        }), 400
 
-    if not isinstance(input_videos, list) or len(input_videos) < 2:
-        return _json_error(400, "Envie pelo menos 2 URLs em 'input_videos'.")
-    if not bucket_name:
-        return _json_error(400, "Campo 'bucket_name' é obrigatório.")
-
-    if not output_filename:
-        output_filename = f"concat_{uuid.uuid4().hex}.mp4"
-    if not output_filename.lower().endswith(".mp4"):
-        output_filename += ".mp4"
-
-    try:
-        _ensure_ffmpeg()
-    except RuntimeError as e:
-        return _json_error(500, str(e))
-
-    tmpdir = tempfile.mkdtemp(prefix="ffmpeg_concat_")
-    local_inputs = []
-    output_local = os.path.join(tmpdir, f"out_{uuid.uuid4().hex}.mp4")
-
+    tmpdir = tempfile.mkdtemp(prefix="ffconcat_")
     try:
         # 1) Download
-        for url in input_videos:
-            local_inputs.append(_download_to_tmp(str(url), tmpdir))
+        local_inputs = []
+        for i, url in enumerate(inputs):
+            ext = ".mp4"
+            local_path = os.path.join(tmpdir, f"in_{i}{ext}")
+            download_file(url, local_path)
+            local_inputs.append(local_path)
 
-        # 2) Lista para concat
-        list_file = _make_list_file(local_inputs, tmpdir)
+        # 2) Concat
+        output_name = f"{out_base}.mp4"
+        out_path = os.path.join(tmpdir, output_name)
+        concat_videos(local_inputs, out_path)
 
-        # 3) Comando FFmpeg
-        if concat_mode == "copy":
-            cmd = [
-                "ffmpeg", "-y",
-                "-f", "concat", "-safe", "0",
-                "-i", list_file,
-                "-c", "copy",
-                output_local
-            ]
-        else:
-            cmd = [
-                "ffmpeg", "-y",
-                "-f", "concat", "-safe", "0",
-                "-i", list_file,
-                "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
-                "-c:a", "aac", "-b:a", "128k",
-                "-movflags", "+faststart",
-                output_local
-            ]
-
-        # 4) Executar
-        _run_ffmpeg(cmd)
-
-        # 5) Upload GCS
-        gs_uri = _upload_to_gcs(output_local, bucket_name, output_filename)
-
-        # 6) URL assinada
-        signed = _signed_url(bucket_name, output_filename, exp_minutes)
+        # 3) Upload Drive
+        creds = get_gcp_creds()
+        file = drive_upload(creds, out_path, folder_id, output_name, make_public=make_public)
 
         return jsonify({
-            "status": "ok",
-            "output_gs_uri": gs_uri,
-            "output_signed_url": signed,
-            "details": {
-                "mode": concat_mode,
-                "inputs": len(local_inputs)
-            }
+            "status": "done",
+            "file_id": file.get("id"),
+            "webViewLink": file.get("webViewLink"),
+            "webContentLink": file.get("webContentLink"),
+            "output_name": file.get("name"),
+            "size": file.get("size")
         }), 200
 
+    except subprocess.CalledProcessError as e:
+        return jsonify({"status": "ffmpeg_error", "returncode": e.returncode}), 500
+    except requests.HTTPError as e:
+        return jsonify({"status": "download_error", "message": str(e)}), 502
     except Exception as e:
-        return _json_error(500, f"Falha no processamento: {e}")
-
+        return jsonify({"status": "error", "message": str(e)}), 500
     finally:
+        # Limpa tmp
         try:
             shutil.rmtree(tmpdir, ignore_errors=True)
         except Exception:
             pass
 
-# ---------- Execução ----------
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "8080"))
     app.run(host="0.0.0.0", port=port)
+
