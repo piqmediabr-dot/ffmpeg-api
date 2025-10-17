@@ -13,6 +13,16 @@ from google.cloud import storage
 from google.api_core import exceptions as gcloud_exceptions
 
 app = Flask(__name__)
+# Aceitar rotas com e sem barra final
+app.url_map.strict_slashes = False
+
+# CORS básico
+@app.after_request
+def add_cors(resp):
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
+    resp.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS, GET"
+    return resp
 
 # ---------- Utilidades ----------
 def _json_error(code: int, msg: str):
@@ -30,16 +40,9 @@ def _download_to_tmp(url: str, tmpdir: str) -> str:
         with requests.get(url, stream=True, timeout=120) as r:
             r.raise_for_status()
             with open(local, "wb") as f:
-                for chunk in r.iterated_content = getattr(r, "iter_content", None)
-                if chunk is None:
-                    # compatibilidade com requests
-                    for chunk in r.iter_content(chunk_size=1024 * 1024):
-                        if chunk:
-                            f.write(chunk)
-                else:
-                    for chunk in r.iterated_content(chunk_size=1024 * 1024):
-                        if chunk:
-                            f.write(chunk)
+                for chunk in r.iter_content(chunk_size=1024 * 1024):
+                    if chunk:
+                        f.write(chunk)
         return local
     except Exception as e:
         raise RuntimeError(f"Falha ao baixar {url}: {e}")
@@ -92,15 +95,19 @@ def index():
 def health():
     return jsonify({"ok": True}), 200
 
-# Mantido para compatibilidade com seu código anterior (placeholder)
+# Mantido para compatibilidade (placeholder)
 @app.route("/process", methods=["POST"])
 def process():
     data = request.get_json(force=True, silent=True) or {}
     return jsonify({"received": data, "status": "processing_soon"}), 200
 
-# ---------- Novo endpoint principal ----------
-@app.route("/concat_and_upload", methods=["POST"])
+# ---------- Endpoint principal ----------
+@app.route("/concat_and_upload", methods=["POST", "OPTIONS"])
 def concat_and_upload():
+    # Preflight CORS
+    if request.method == "OPTIONS":
+        return ("", 204)
+
     """
     Body JSON:
     {
