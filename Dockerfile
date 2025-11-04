@@ -31,5 +31,5 @@ ENV PORT=8080
 
 # Servidor web (gunicorn) chamando app:app
 # 2 workers, 4 threads, sem timeout hard (deixa a thread background trabalhar)
-CMD exec gunicorn -b 0.0.0.0:${PORT} app:app --workers 2 --threads 4 --timeout 0
+CMD ["gunicorn", "-w", "1", "-b", ":8080", "app:app"]
 
