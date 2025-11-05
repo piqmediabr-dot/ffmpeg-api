@@ -31,5 +31,5 @@ ENV PORT=8080
 
 # Servidor web (gunicorn) chamando app:app
 # 2 workers, 4 threads, sem timeout hard (deixa a thread background trabalhar)
-CMD ["gunicorn", "--bind", ":8080", "--workers", "1", "--threads", "4", "--log-level", "debug", "--access-logfile", "-", "--error-logfile", "-", "app:app"]
+CMD ["python", "-m", "flask", "run", "--host=0.0.0.0", "--port=8080"]
 
