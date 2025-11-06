@@ -25,12 +25,11 @@ RUN pip install --upgrade pip setuptools wheel && \
     pip install --no-cache-dir gunicorn
 
 # Código
-COPY . .
+COPY app.py .
 
-# Porta padrão do Cloud Run (será sobrescrita pela plataforma)
+# Porta padrão do Cloud Run
 ENV PORT=8080
 
-# Servidor web (gunicorn) — 1 worker gthread, 8 threads, sem timeout hard
-# Usamos shell para interpolar ${PORT}
+# Use shell pra interpolar ${PORT}
 CMD ["bash","-lc","exec gunicorn -w 1 -k gthread --threads 8 --timeout 0 -b 0.0.0.0:${PORT} app:app"]
 
