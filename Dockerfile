@@ -21,14 +21,16 @@ ENV PATH="/opt/venv/bin:${PATH}"
 # Dependências
 COPY requirements.txt ./
 RUN pip install --upgrade pip setuptools wheel && \
-    pip install --no-cache-dir -r requirements.txt
+    pip install --no-cache-dir -r requirements.txt && \
+    pip install --no-cache-dir gunicorn
 
 # Código
 COPY . .
 
-# Porta
+# Porta padrão do Cloud Run (será sobrescrita pela plataforma)
 ENV PORT=8080
 
-# Servidor web (gunicorn) chamando app:app
-# 2 workers, 4 threads, sem timeout hard (deixa a thread background trabalhar)
-CMD ["gunicorn", "-b", ":8080", "--workers", "2", "--threads", "4", "--timeout", "0", "app:app"]
+# Servidor web (gunicorn) — 1 worker gthread, 8 threads, sem timeout hard
+# Usamos shell para interpolar ${PORT}
+CMD ["bash","-lc","exec gunicorn -w 1 -k gthread --threads 8 --timeout 0 -b 0.0.0.0:${PORT} app:app"]
+
