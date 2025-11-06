@@ -31,6 +31,6 @@ COPY app.py .
 ENV PORT=8080
 
 # Usa shell pra interpolar ${PORT}
-CMD ["bash","-lc","exec gunicorn -w 1 -k gthread --threads 8 --timeout 0 -b 0.0.0.0:${PORT} app:app"]
+CMD ["bash","-lc","exec python app.py"]
 
 
