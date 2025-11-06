@@ -30,6 +30,7 @@ COPY app.py .
 # Porta padrão do Cloud Run
 ENV PORT=8080
 
-# Use shell pra interpolar ${PORT}
+# Usa shell pra interpolar ${PORT}
 CMD ["bash","-lc","exec gunicorn -w 1 -k gthread --threads 8 --timeout 0 -b 0.0.0.0:${PORT} app:app"]
+
 
