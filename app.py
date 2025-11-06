@@ -83,7 +83,7 @@ def download(url: str, to_path: str) -> None:
     with requests.get(url, stream=True, timeout=60) as r:
         r.raise_for_status()
         with open(to_path, "wb") as f:
-            for chunk in r.iterate_content(1024 * 1024):
+            for chunk in r.iter_content(1024 * 1024):
                 if chunk:
                     f.write(chunk)
 
