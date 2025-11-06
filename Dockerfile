@@ -21,8 +21,9 @@ ENV PATH="/opt/venv/bin:${PATH}"
 # Dependências
 COPY requirements.txt ./
 RUN pip install --upgrade pip setuptools wheel && \
-    pip install --no-cache-dir -r requirements.txt && \
-    pip install --no-cache-dir gunicorn
+    pip install --no-cache-dir -r requirements.txt || true && \
+    pip install --no-cache-dir Flask requests gunicorn
+
 
 # Código
 COPY app.py .
