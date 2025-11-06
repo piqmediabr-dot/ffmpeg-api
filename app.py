@@ -16,20 +16,20 @@
 #         "video_bitrate": "4M",                 # opcional (env DEFAULT_VIDEO_BR)
 #         "audio_bitrate": "192k",               # opcional (env DEFAULT_AUDIO_BR)
 #         "audio_url": "https://.../bgm.mp3",    # opcional (BGM/narração)
+#         "audio_gain": 0.2,                     # opcional (0.0–1.0) volume linear (padrão 0.2)
 #         "output_name": "final.mp4",            # opcional
 #         "upload": false,                       # opcional (env UPLOAD_TO_DRIVE)
 #         "drive_folder_id": "..."               # obrigatório se upload=true
 #       }
 #
 # Observações:
-# - Os clipes são normalizados SEM áudio (-an), evitando erro quando o input é mudo.
+# - Clipes são normalizados SEM áudio (-an), evitando erro em inputs mudos.
 # - Concatenação via demuxer (arquivo inputs.txt) copiando streams de vídeo.
-# - Se "audio_url" vier, faz replace/mix do áudio no final.
-# - Upload ao Drive é opcional; esta função está como stub seguro por padrão.
+# - Se "audio_url" vier, faz replace/mix do áudio no final com ganho (audio_gain).
+# - Upload ao Drive está como stub seguro (retorna links fake) quando upload=true.
 # ------------------------------------------------------------
 
 import os
-import io
 import uuid
 import json
 import shutil
@@ -78,10 +78,8 @@ def download(url: str, to_path: str) -> None:
 def upload_to_drive(local_path: str, name: str, folder_id: str) -> dict:
     """
     Stub seguro para upload ao Google Drive.
-    Substitua por sua implementação real (google-api-python-client) quando quiser usar upload=true.
-    Retorna um dicionário com chaves semelhantes às do Drive.
+    Substitua por sua implementação real quando quiser usar upload=true.
     """
-    # Evita falhas enquanto você usa UPLOAD_TO_DRIVE=false
     return {
         "id": "fake-id",
         "name": name,
@@ -92,9 +90,9 @@ def upload_to_drive(local_path: str, name: str, folder_id: str) -> dict:
 # =========================
 # Núcleo de vídeo/áudio
 # =========================
-def _baixar_videos_normalizar_sem_audio(clips: list[dict], tmpdir: str,
-                                       resolution: str, fps: int,
-                                       vbr: str, abr: str) -> list[str]:
+def _baixar_videos_normalizar_sem_audio(
+    clips: list[dict], tmpdir: str, resolution: str, fps: int, vbr: str, abr: str
+) -> list[str]:
     """
     Baixa e normaliza cada clipe APENAS VÍDEO (-an).
     Aceita "source_url" ou "url" em cada item.
@@ -120,7 +118,7 @@ def _baixar_videos_normalizar_sem_audio(clips: list[dict], tmpdir: str,
         if c.get("to"):
             cmd += ["-to", str(c["to"])]
 
-        # Normalização VÍDEO-ONLY (sem áudio): scale+pad, fps, codec, bitrate, yuv420p
+        # Normalização VÍDEO-ONLY (sem áudio)
         cmd += [
             "-vf", f"scale={resolution}:force_original_aspect_ratio=decrease,"
                    f"pad={resolution}:(ow-iw)/2:(oh-ih)/2,setsar=1",
@@ -128,7 +126,7 @@ def _baixar_videos_normalizar_sem_audio(clips: list[dict], tmpdir: str,
             "-c:v", "libx264",
             "-b:v", vbr,
             "-pix_fmt", "yuv420p",
-            "-an",  # <- remove qualquer áudio do clipe
+            "-an",
             norm
         ]
         run(cmd)
@@ -159,10 +157,10 @@ def _concat_video_apenas_por_demuxer(norm_paths: list[str], tmpdir: str, output_
     shutil.copyfile(concat_out, final_out)
     return final_out
 
-def _mix_audio_se_houver(final_video_path: str, audio_url: str | None, tmpdir: str, abr: str) -> str:
+def _mix_audio_se_houver(final_video_path: str, audio_url: str | None, tmpdir: str, abr: str, audio_gain: float) -> str:
     """
     Se houver audio_url, baixa e faz replace/mix: mantém vídeo do arquivo final e
-    usa o áudio externo (BGM/narração). Retorna o caminho com áudio.
+    usa o áudio externo (BGM/narração) com ganho (0.0–1.0). Retorna o caminho com áudio.
     """
     if not audio_url:
         return final_video_path
@@ -171,12 +169,14 @@ def _mix_audio_se_houver(final_video_path: str, audio_url: str | None, tmpdir: s
     download(audio_url, local_audio)
 
     mixed_out = os.path.join(tmpdir, "mixed.mp4")
+    # volume=audio_gain  -> 0.0 (mudo) a 1.0 (volume original). Ex.: 0.2 = 20%.
     run([
         "ffmpeg", "-y",
         "-i", final_video_path, "-i", local_audio,
         "-map", "0:v:0", "-map", "1:a:0",
         "-c:v", "copy",
         "-c:a", "aac", "-b:a", abr,
+        "-filter:a", f"volume={audio_gain}",
         "-shortest",
         mixed_out
     ])
@@ -187,8 +187,8 @@ def _run_concat_and_upload(data: dict) -> None:
     Trabalho pesado em thread:
       1) normaliza clipes sem áudio
       2) concatena vídeo
-      3) mixa áudio externo, se houver
-      4) (opcional) faz upload ao Drive
+      3) mixa áudio externo, se houver (com audio_gain)
+      4) (opcional) upload ao Drive (stub)
     """
     tmpdir = None
     try:
@@ -200,14 +200,22 @@ def _run_concat_and_upload(data: dict) -> None:
             print("[worker] payload sem 'clips'", flush=True)
             return
 
-        resolution   = data.get("resolution", DEFAULT_RESOLUTION)
-        fps          = int(data.get("fps", DEFAULT_FPS))
-        vbr          = data.get("video_bitrate", DEFAULT_VIDEO_BR)
-        abr          = data.get("audio_bitrate", DEFAULT_AUDIO_BR)
-        audio_url    = data.get("audio_url")
-        upload_flag  = bool(data.get("upload", UPLOAD_TO_DRIVE))
-        drive_folder = data.get("drive_folder_id", DRIVE_FOLDER_ID)
-        output_name  = data.get("output_name", f"out-{uuid.uuid4().hex[:8]}.mp4")
+        resolution    = data.get("resolution", DEFAULT_RESOLUTION)
+        fps           = int(data.get("fps", DEFAULT_FPS))
+        vbr           = data.get("video_bitrate", DEFAULT_VIDEO_BR)
+        abr           = data.get("audio_bitrate", DEFAULT_AUDIO_BR)
+        audio_url     = data.get("audio_url")
+        # NOVO: ganho da trilha (linear 0.0–1.0), padrão 0.2 (=20%)
+        try:
+            audio_gain = float(data.get("audio_gain", 0.2))
+        except Exception:
+            audio_gain = 0.2
+        # clamp básico
+        audio_gain = max(0.0, min(audio_gain, 5.0))  # permite até 5x se quiser
+
+        upload_flag   = bool(data.get("upload", UPLOAD_TO_DRIVE))
+        drive_folder  = data.get("drive_folder_id", DRIVE_FOLDER_ID)
+        output_name   = data.get("output_name", f"out-{uuid.uuid4().hex[:8]}.mp4")
 
         tmpdir = tempfile.mkdtemp(prefix="ffx_")
 
@@ -224,8 +232,8 @@ def _run_concat_and_upload(data: dict) -> None:
         # 2) Concat vídeo
         final_out = _concat_video_apenas_por_demuxer(norm_paths, tmpdir, output_name)
 
-        # 3) Mix/replace áudio (opcional)
-        final_with_audio = _mix_audio_se_houver(final_out, audio_url, tmpdir, abr)
+        # 3) Mix/replace áudio (opcional, com ganho)
+        final_with_audio = _mix_audio_se_houver(final_out, audio_url, tmpdir, abr, audio_gain)
 
         # 4) Upload (opcional)
         if upload_flag:
@@ -269,8 +277,6 @@ def concat_and_upload():
     if not isinstance(clips, list) or not clips:
         return jsonify({"ok": False, "error": "clips vazio ou inválido"}), 400
 
-    # Compat: aceita "source_url" OU "url" no backend
-    # (a normalização já trata isso)
     job_id = uuid.uuid4().hex[:12]
     threading.Thread(target=_run_concat_and_upload, args=(data,), daemon=True).start()
     return jsonify({"status": "accepted", "job_id": job_id}), 202
@@ -280,6 +286,6 @@ def concat_and_upload():
 # =========================
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "8080"))
-    # host 0.0.0.0 é obrigatório para Cloud Run
     app.run(host="0.0.0.0", port=port)
+
 
