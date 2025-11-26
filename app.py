@@ -67,7 +67,7 @@ def download(url: str, to_path: str) -> None:
                     f.write(chunk)
 
 def upload_to_drive(local_path: str, name: str, folder_id: str) -> dict:
-    # Stub seguro (substituir pela integração real quando desejar)
+    # Stub seguro (trocar pela integração real depois)
     return {
         "id": "fake-id",
         "name": name,
@@ -103,7 +103,7 @@ def _baixar_videos_normalizar_sem_audio(
         download(url, local_path)
         local_videos.append({"path": local_path, "ss": clip.get("ss"), "to": clip.get("to")})
 
-    # Converte "1080x1920" -> (1080,1920) e monta filtro correto
+    # Converte "1080x1920" -> (1080,1920) e monta filtro correto com ':'
     w, h = _parse_res(resolution)
     vf = (
         f"scale={w}:{h}:force_original_aspect_ratio=decrease,"
@@ -269,4 +269,5 @@ def concat_and_upload():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "8080"))
     app.run(host="0.0.0.0", port=port)
+
 
