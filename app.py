@@ -12,7 +12,7 @@
 #           { "url": "https://..." },            # "url" também é aceito
 #           ...
 #         ],
-#         "resolution": "1080x1920",            # opcional (env DEFAULT_RESOLUTION)
+#         "resolution": "1080x1920",            # opcional (env DEFAULT_RESOLUTION) | aceita "1080:1920"
 #         "fps": 30,                            # opcional (env DEFAULT_FPS)
 #         "video_bitrate": "4M",                # opcional (env DEFAULT_VIDEO_BR)
 #         "audio_bitrate": "192k",              # opcional (env DEFAULT_AUDIO_BR)
@@ -54,11 +54,15 @@ def ffmpeg_exists() -> bool:
     return which("ffmpeg") is not None
 
 def run(cmd: list[str]) -> None:
+    # Loga o comando ffmpeg/aux antes de rodar
+    print("[ffmpeg] CMD:", " ".join(cmd), flush=True)
     p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     if p.returncode != 0:
+        # Joga o stderr inteiro na exceção pra aparecer nos logs
         raise RuntimeError(f"FFmpeg/Proc error ({p.returncode}):\n{p.stderr}")
 
 def download(url: str, to_path: str) -> None:
+    print(f"[download] GET {url} -> {to_path}", flush=True)
     with requests.get(url, stream=True, timeout=60) as r:
         r.raise_for_status()
         with open(to_path, "wb") as f:
@@ -68,6 +72,7 @@ def download(url: str, to_path: str) -> None:
 
 def upload_to_drive(local_path: str, name: str, folder_id: str) -> dict:
     # Stub seguro (trocar pela integração real depois)
+    print(f"[drive] stub upload {local_path} as {name} to folder {folder_id}", flush=True)
     return {
         "id": "fake-id",
         "name": name,
@@ -94,6 +99,7 @@ def _parse_res(res: str) -> tuple[int, int]:
 def _baixar_videos_normalizar_sem_audio(
     clips: list[dict], tmpdir: str, resolution: str, fps: int, vbr: str, abr: str
 ) -> list[str]:
+    print(f"[worker] baixar/normalizar - clips={len(clips)} res={resolution} fps={fps} vbr={vbr}", flush=True)
     local_videos = []
     for i, clip in enumerate(clips):
         url = clip.get("source_url") or clip.get("url")
@@ -110,6 +116,7 @@ def _baixar_videos_normalizar_sem_audio(
         f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:color=black,"
         f"setsar=1"
     )
+    print(f"[worker] vf='{vf}'", flush=True)
 
     norm_paths = []
     for i, c in enumerate(local_videos):
@@ -133,6 +140,7 @@ def _baixar_videos_normalizar_sem_audio(
         run(cmd)
         norm_paths.append(norm)
 
+    print(f"[worker] normalizados={len(norm_paths)}", flush=True)
     return norm_paths
 
 def _concat_video_apenas_por_demuxer(norm_paths: list[str], tmpdir: str, output_name: str) -> str:
@@ -155,6 +163,7 @@ def _concat_video_apenas_por_demuxer(norm_paths: list[str], tmpdir: str, output_
         output_name if output_name.endswith(".mp4") else output_name + ".mp4"
     )
     shutil.copyfile(concat_out, final_out)
+    print(f"[worker] concat -> {final_out}", flush=True)
     return final_out
 
 def _mix_audio_se_houver(final_video_path: str, audio_url: str | None, tmpdir: str, abr: str, audio_gain: float) -> str:
@@ -175,11 +184,20 @@ def _mix_audio_se_houver(final_video_path: str, audio_url: str | None, tmpdir: s
         "-shortest",
         mixed_out
     ])
+    print(f"[worker] mix -> {mixed_out}", flush=True)
     return mixed_out
 
 def _run_concat_and_upload(data: dict) -> None:
     tmpdir = None
     try:
+        print(f"[worker] start job - data_keys={list((data or {}).keys())}", flush=True)
+        print(
+            f"[worker] cfg resolution={data.get('resolution', DEFAULT_RESOLUTION)} "
+            f"fps={data.get('fps', DEFAULT_FPS)} vbr={data.get('video_bitrate', DEFAULT_VIDEO_BR)} "
+            f"abr={data.get('audio_bitrate', DEFAULT_AUDIO_BR)} upload={data.get('upload', UPLOAD_TO_DRIVE)}",
+            flush=True
+        )
+
         if not ffmpeg_exists():
             print("[worker] ffmpeg não encontrado no container", flush=True)
             return
@@ -205,6 +223,7 @@ def _run_concat_and_upload(data: dict) -> None:
         output_name   = data.get("output_name", f"out-{uuid.uuid4().hex[:8]}.mp4")
 
         tmpdir = tempfile.mkdtemp(prefix="ffx_")
+        print(f"[worker] tmpdir={tmpdir}", flush=True)
 
         norm_paths = _baixar_videos_normalizar_sem_audio(
             clips=data["clips"],
@@ -231,12 +250,15 @@ def _run_concat_and_upload(data: dict) -> None:
         else:
             print("[worker] arquivo final pronto (sem upload):", final_with_audio, flush=True)
 
+        print("[worker] done", flush=True)
+
     except Exception as e:
         print(f"[worker] ERRO: {e}", flush=True)
     finally:
         if tmpdir:
             try:
                 shutil.rmtree(tmpdir, ignore_errors=True)
+                print(f"[worker] tmpdir removido: {tmpdir}", flush=True)
             except Exception:
                 pass
 
@@ -257,17 +279,21 @@ def healthz():
 
 @app.post("/concat_and_upload")
 def concat_and_upload():
+    print("[api] /concat_and_upload called", flush=True)
     data = request.get_json(force=True, silent=False)
     clips = (data or {}).get("clips") or []
     if not isinstance(clips, list) or not clips:
         return jsonify({"ok": False, "error": "clips vazio ou inválido"}), 400
 
     job_id = uuid.uuid4().hex[:12]
+    print(f"[api] job_id={job_id}", flush=True)
     threading.Thread(target=_run_concat_and_upload, args=(data,), daemon=True).start()
     return jsonify({"status": "accepted", "job_id": job_id}), 202
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "8080"))
+    print(f"[boot] starting Flask dev server on :{port}", flush=True)
     app.run(host="0.0.0.0", port=port)
+
 
 
