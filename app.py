@@ -1,9 +1,9 @@
-cat > app.py << 'PY'
 # app.py — FFmpeg API (Cloud Run) - concat demuxer + mix opcional de áudio
 # ------------------------------------------------------------
 # Endpoints:
-#   GET  /            -> {"message":"FFmpeg API online","status":"ok"}
-#   GET  /healthz     -> {"status":"ok"}
+#   GET  /             -> {"message":"FFmpeg API online","status":"ok"}
+#   GET  /health       -> {"status":"ok"}
+#   GET  /healthz      -> {"status":"ok"}
 #   POST /concat_and_upload
 #       Payload JSON:
 #       {
@@ -17,22 +17,15 @@ cat > app.py << 'PY'
 #         "video_bitrate": "4M",                # opcional (env DEFAULT_VIDEO_BR)
 #         "audio_bitrate": "192k",              # opcional (env DEFAULT_AUDIO_BR)
 #         "audio_url": "https://.../bgm.mp3",   # opcional (BGM/narração)
-#         "audio_gain": 0.2,                    # opcional (0.0–1.0) volume linear (padrão 0.2)
+#         "audio_gain": 0.2,                    # opcional (0.0–5.0) volume linear
 #         "output_name": "final.mp4",           # opcional
 #         "upload": false,                      # opcional (env UPLOAD_TO_DRIVE)
 #         "drive_folder_id": "..."              # obrigatório se upload=true
 #       }
-#
-# Observações:
-# - Clipes são normalizados SEM áudio (-an), evitando erro em inputs mudos.
-# - Concatenação via demuxer (arquivo inputs.txt) copiando streams de vídeo.
-# - Se "audio_url" vier, faz replace/mix do áudio no final com ganho (audio_gain).
-# - Upload ao Drive está como stub seguro (retorna links fake) quando upload=true.
 # ------------------------------------------------------------
 
 import os
 import uuid
-import json
 import shutil
 import threading
 import tempfile
@@ -61,9 +54,9 @@ def ffmpeg_exists() -> bool:
     return which("ffmpeg") is not None
 
 def run(cmd: list[str]) -> None:
-    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    if proc.returncode != 0:
-        raise RuntimeError(f"FFmpeg/Proc error ({proc.returncode}):\n{proc.stderr}")
+    p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if p.returncode != 0:
+        raise RuntimeError(f"FFmpeg/Proc error ({p.returncode}):\n{p.stderr}")
 
 def download(url: str, to_path: str) -> None:
     with requests.get(url, stream=True, timeout=60) as r:
@@ -74,12 +67,26 @@ def download(url: str, to_path: str) -> None:
                     f.write(chunk)
 
 def upload_to_drive(local_path: str, name: str, folder_id: str) -> dict:
+    # Stub seguro (substituir pela integração real quando desejar)
     return {
         "id": "fake-id",
         "name": name,
         "webViewLink": "https://drive.google.com/",
         "webContentLink": "https://drive.google.com/",
     }
+
+def _parse_res(res: str) -> tuple[int, int]:
+    """
+    Aceita "1080x1920" ou "1080:1920" e retorna (w, h) inteiros.
+    """
+    s = str(res).lower().strip()
+    if "x" in s:
+        w, h = s.split("x", 1)
+    elif ":" in s:
+        w, h = s.split(":", 1)
+    else:
+        raise ValueError(f"resolution inválida: {res}")
+    return int(w), int(h)
 
 # =========================
 # Núcleo de vídeo/áudio
@@ -92,10 +99,17 @@ def _baixar_videos_normalizar_sem_audio(
         url = clip.get("source_url") or clip.get("url")
         if not url:
             raise ValueError(f"clip[{i}] sem 'source_url'/'url' no payload")
-
         local_path = os.path.join(tmpdir, f"clip_{i}.mp4")
         download(url, local_path)
         local_videos.append({"path": local_path, "ss": clip.get("ss"), "to": clip.get("to")})
+
+    # Converte "1080x1920" -> (1080,1920) e monta filtro correto
+    w, h = _parse_res(resolution)
+    vf = (
+        f"scale={w}:{h}:force_original_aspect_ratio=decrease,"
+        f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:color=black,"
+        f"setsar=1"
+    )
 
     norm_paths = []
     for i, c in enumerate(local_videos):
@@ -108,8 +122,7 @@ def _baixar_videos_normalizar_sem_audio(
             cmd += ["-to", str(c["to"])]
 
         cmd += [
-            "-vf", f"scale={resolution}:force_original_aspect_ratio=decrease,"
-                   f"pad={resolution}:(ow-iw)/2:(oh-ih)/2,setsar=1",
+            "-vf", vf,
             "-r", str(fps),
             "-c:v", "libx264",
             "-b:v", vbr,
@@ -137,7 +150,10 @@ def _concat_video_apenas_por_demuxer(norm_paths: list[str], tmpdir: str, output_
         concat_out
     ])
 
-    final_out = os.path.join(tmpdir, output_name if output_name.endswith(".mp4") else output_name + ".mp4")
+    final_out = os.path.join(
+        tmpdir,
+        output_name if output_name.endswith(".mp4") else output_name + ".mp4"
+    )
     shutil.copyfile(concat_out, final_out)
     return final_out
 
@@ -231,6 +247,10 @@ def _run_concat_and_upload(data: dict) -> None:
 def root():
     return jsonify({"message": "FFmpeg API online", "status": "ok"}), 200
 
+@app.get("/health")
+def health():
+    return jsonify({"status": "ok"}), 200
+
 @app.get("/healthz")
 def healthz():
     return jsonify({"status": "ok"}), 200
@@ -249,4 +269,4 @@ def concat_and_upload():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "8080"))
     app.run(host="0.0.0.0", port=port)
-PY
+
