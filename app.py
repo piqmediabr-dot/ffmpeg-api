@@ -1,27 +1,28 @@
+cat > app.py <<'PY'
 # app.py — FFmpeg API (Cloud Run) - concat demuxer + mix opcional de áudio
 # ------------------------------------------------------------
 # Endpoints:
 #   GET  /             -> {"message":"FFmpeg API online","status":"ok"}
 #   GET  /health       -> {"status":"ok"}
 #   GET  /healthz      -> {"status":"ok"}
-#   POST /concat_and_upload   (assíncrono: dispara thread e responde 202)
-#   POST /concat_sync         (síncrono: executa no request e devolve 200/500)
+#   POST /concat_and_upload   -> assíncrono (retorna 202)
+#   POST /concat_sync         -> síncrono (retorna 200/500)
 #
-# Payload (ambos):
+# Payload JSON (para ambos):
 # {
 #   "clips": [
 #     { "source_url": "https://...", "ss": "0", "to": "5" },
-#     { "url": "https://..." }
+#     { "url": "https://..." }               # "url" também é aceito
 #   ],
-#   "resolution": "1080x1920" ou "1080:1920",
-#   "fps": 30,
-#   "video_bitrate": "4M",
-#   "audio_bitrate": "192k",
-#   "audio_url": "https://.../bgm.mp3",
-#   "audio_gain": 0.2,
-#   "output_name": "final.mp4",
-#   "upload": false,
-#   "drive_folder_id": "..."
+#   "resolution": "1080x1920" ou "1080:1920", # opcional (env DEFAULT_RESOLUTION)
+#   "fps": 30,                                # opcional (env DEFAULT_FPS)
+#   "video_bitrate": "4M",                    # opcional (env DEFAULT_VIDEO_BR)
+#   "audio_bitrate": "192k",                  # opcional (env DEFAULT_AUDIO_BR)
+#   "audio_url": "https://.../bgm.mp3",       # opcional (BGM/narração)
+#   "audio_gain": 0.2,                        # opcional (0.0–5.0) volume linear
+#   "output_name": "final.mp4",               # opcional
+#   "upload": false,                          # opcional (env UPLOAD_TO_DRIVE)
+#   "drive_folder_id": "..."                  # obrigatório se upload=true
 # }
 # ------------------------------------------------------------
 
@@ -31,7 +32,6 @@ import shutil
 import threading
 import tempfile
 import subprocess
-from datetime import datetime
 
 from flask import Flask, request, jsonify
 import requests
@@ -39,21 +39,14 @@ import requests
 app = Flask(__name__)
 
 # =========================
-# Configs (ENV)
+# Configurações (ENV)
 # =========================
 DEFAULT_RESOLUTION = os.getenv("DEFAULT_RESOLUTION", "1080x1920")
 DEFAULT_FPS        = int(os.getenv("DEFAULT_FPS", "30"))
 DEFAULT_VIDEO_BR   = os.getenv("DEFAULT_VIDEO_BR", "4M")
 DEFAULT_AUDIO_BR   = os.getenv("DEFAULT_AUDIO_BR", "192k")
 UPLOAD_TO_DRIVE    = os.getenv("UPLOAD_TO_DRIVE", "false").lower() == "true"
-DRIVE_FOLDER_ID    = os.getenv("DRIVE_FOLDER_ID", "")
-
-def _now():
-    return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-
-def _log(msg):
-    # sempre com prefixo [worker] para facilitar filtro no Cloud Logging
-    print(f"[worker] {_now()} {msg}", flush=True)
+DRIVE_FOLDER_ID    = os.getenv("DRIVE_FOLDER_ID", "")  # usado somente se upload=true
 
 # =========================
 # Helpers
@@ -63,18 +56,12 @@ def ffmpeg_exists() -> bool:
     return which("ffmpeg") is not None
 
 def run(cmd: list[str]) -> None:
-    _log(f"RUN: {' '.join(cmd)}")
     p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    if p.stdout:
-        _log(f"STDOUT:\n{p.stdout}")
-    if p.stderr:
-        _log(f"STDERR:\n{p.stderr}")
     if p.returncode != 0:
-        raise RuntimeError(f"FFmpeg/Proc error ({p.returncode})")
+        raise RuntimeError(f"FFmpeg/Proc error ({p.returncode}):\n{p.stderr}")
 
 def download(url: str, to_path: str) -> None:
-    _log(f"Baixando: {url} -> {to_path}")
-    with requests.get(url, stream=True, timeout=120) as r:
+    with requests.get(url, stream=True, timeout=60) as r:
         r.raise_for_status()
         with open(to_path, "wb") as f:
             for chunk in r.iter_content(chunk_size=1024 * 1024):
@@ -118,13 +105,13 @@ def _baixar_videos_normalizar_sem_audio(
         download(url, local_path)
         local_videos.append({"path": local_path, "ss": clip.get("ss"), "to": clip.get("to")})
 
+    # Converte "1080x1920" -> (1080,1920) e monta filtro correto com ':'
     w, h = _parse_res(resolution)
     vf = (
         f"scale={w}:{h}:force_original_aspect_ratio=decrease,"
         f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:color=black,"
         f"setsar=1"
     )
-    _log(f"VF montado: {vf} | fps={fps} vbr={vbr}")
 
     norm_paths = []
     for i, c in enumerate(local_videos):
@@ -166,7 +153,8 @@ def _concat_video_apenas_por_demuxer(norm_paths: list[str], tmpdir: str, output_
     ])
 
     final_out = os.path.join(
-        tmpdir, output_name if output_name.endswith(".mp4") else output_name + ".mp4"
+        tmpdir,
+        output_name if output_name.endswith(".mp4") else output_name + ".mp4"
     )
     shutil.copyfile(concat_out, final_out)
     return final_out
@@ -191,31 +179,34 @@ def _mix_audio_se_houver(final_video_path: str, audio_url: str | None, tmpdir: s
     ])
     return mixed_out
 
-def _pipeline(data: dict) -> dict:
+def _pipeline(data: dict) -> str:
+    """
+    Executa todo o pipeline e retorna o caminho do arquivo final no disco.
+    Lança exceções em caso de erro (para o /concat_sync responder 500).
+    """
     if not ffmpeg_exists():
         raise RuntimeError("ffmpeg não encontrado no container")
 
     if not data or "clips" not in data or not data["clips"]:
         raise ValueError("payload sem 'clips'")
 
-    resolution   = data.get("resolution", DEFAULT_RESOLUTION)
-    fps          = int(data.get("fps", DEFAULT_FPS))
-    vbr          = data.get("video_bitrate", DEFAULT_VIDEO_BR)
-    abr          = data.get("audio_bitrate", DEFAULT_AUDIO_BR)
-    audio_url    = data.get("audio_url")
-    audio_gain   = float(data.get("audio_gain", 0.2))
-    audio_gain   = max(0.0, min(audio_gain, 5.0))
-    upload_flag  = bool(data.get("upload", UPLOAD_TO_DRIVE))
-    drive_folder = data.get("drive_folder_id", DRIVE_FOLDER_ID)
-    output_name  = data.get("output_name", f"out-{uuid.uuid4().hex[:8]}.mp4")
+    resolution    = data.get("resolution", DEFAULT_RESOLUTION)
+    fps           = int(data.get("fps", DEFAULT_FPS))
+    vbr           = data.get("video_bitrate", DEFAULT_VIDEO_BR)
+    abr           = data.get("audio_bitrate", DEFAULT_AUDIO_BR)
+    audio_url     = data.get("audio_url")
 
-    _log(f"REQ: resolution={resolution} fps={fps} vbr={vbr} abr={abr} "
-         f"audio_url={bool(audio_url)} audio_gain={audio_gain} "
-         f"upload={upload_flag} drive_folder={(drive_folder[:6]+'...' if drive_folder else '')} "
-         f"output_name={output_name}")
+    try:
+        audio_gain = float(data.get("audio_gain", 0.2))
+    except Exception:
+        audio_gain = 0.2
+    audio_gain = max(0.0, min(audio_gain, 5.0))
+
+    upload_flag   = bool(data.get("upload", UPLOAD_TO_DRIVE))
+    drive_folder  = data.get("drive_folder_id", DRIVE_FOLDER_ID)
+    output_name   = data.get("output_name", f"out-{uuid.uuid4().hex[:8]}.mp4")
 
     tmpdir = tempfile.mkdtemp(prefix="ffx_")
-    _log(f"TMP criado: {tmpdir}")
     try:
         norm_paths = _baixar_videos_normalizar_sem_audio(
             clips=data["clips"],
@@ -225,35 +216,38 @@ def _pipeline(data: dict) -> dict:
             vbr=vbr,
             abr=abr,
         )
+
         final_out = _concat_video_apenas_por_demuxer(norm_paths, tmpdir, output_name)
         final_with_audio = _mix_audio_se_houver(final_out, audio_url, tmpdir, abr, audio_gain)
 
-        resp = {"ok": True, "path": final_with_audio}
         if upload_flag:
             if not drive_folder:
-                raise ValueError("upload=true mas sem drive_folder_id")
-            info = upload_to_drive(final_with_audio, os.path.basename(final_with_audio), drive_folder)
-            resp["upload"] = {
-                "id": info.get("id"),
-                "webViewLink": info.get("webViewLink"),
-                "webContentLink": info.get("webContentLink"),
-            }
-            _log(f"Upload ok: {resp['upload']}")
+                print("[worker] upload=true mas sem drive_folder_id", flush=True)
+            else:
+                info = upload_to_drive(final_with_audio, os.path.basename(final_with_audio), drive_folder)
+                print("[worker] upload ok:", {
+                    "id": info.get("id"),
+                    "webViewLink": info.get("webViewLink"),
+                    "webContentLink": info.get("webContentLink"),
+                }, flush=True)
         else:
-            _log(f"Arquivo pronto (sem upload): {final_with_audio}")
-        return resp
+            print("[worker] arquivo final pronto (sem upload):", final_with_audio, flush=True)
+
+        return final_with_audio
+    except Exception as e:
+        print(f"[worker] ERRO: {e}", flush=True)
+        raise
     finally:
         try:
             shutil.rmtree(tmpdir, ignore_errors=True)
-            _log(f"TMP removido: {tmpdir}")
-        except Exception as e:
-            _log(f"Falha ao remover TMP: {e}")
+        except Exception:
+            pass
 
 def _run_concat_and_upload(data: dict) -> None:
     try:
-        _ = _pipeline(data)
-    except Exception as e:
-        _log(f"ERRO: {e}")
+        _pipeline(data)
+    except Exception:
+        pass
 
 # =========================
 # Rotas HTTP
@@ -268,33 +262,36 @@ def health():
 
 @app.get("/healthz")
 def healthz():
-    return jsonify({"status": "ok"}), 200
+    return jsonify({"status":"ok"}), 200
 
 @app.post("/concat_and_upload")
 def concat_and_upload():
-    # assíncrono (thread)
     data = request.get_json(force=True, silent=False)
     clips = (data or {}).get("clips") or []
     if not isinstance(clips, list) or not clips:
         return jsonify({"ok": False, "error": "clips vazio ou inválido"}), 400
+
     job_id = uuid.uuid4().hex[:12]
     threading.Thread(target=_run_concat_and_upload, args=(data,), daemon=True).start()
     return jsonify({"status": "accepted", "job_id": job_id}), 202
 
 @app.post("/concat_sync")
 def concat_sync():
-    # síncrono (depuração)
+    """
+    Versão síncrona — útil para teste. Aguarda o FFmpeg terminar.
+    """
     try:
         data = request.get_json(force=True, silent=False)
-        result = _pipeline(data)
-        return jsonify(result), 200
+        clips = (data or {}).get("clips") or []
+        if not isinstance(clips, list) or not clips:
+            return jsonify({"ok": False, "error": "clips vazio ou inválido"}), 400
+
+        out_path = _pipeline(data)
+        return jsonify({"ok": True, "message": "done", "output": os.path.basename(out_path)}), 200
     except Exception as e:
-        _log(f"ERRO sync: {e}")
         return jsonify({"ok": False, "error": str(e)}), 500
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "8080"))
     app.run(host="0.0.0.0", port=port)
-
-
-
+PY
